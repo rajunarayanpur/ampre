@@ -1,0 +1,63 @@
+
+<div class="page">
+  <main>
+    <!-- 头部（官网 artist-expression-header）：circular 圆形头像 / wide 通栏图片 / video 通栏动态视频 / no-artwork -->
+    <section class="artist-hero circular" id="hero">
+      <div class="artist-hero-bg" aria-hidden="true">
+        <div class="artist-hero-art" id="hero-art"></div>
+        <div class="artist-hero-tint"></div>
+        <div class="artist-hero-blur"></div>
+        <div class="artist-portrait-glow" id="portrait-glow"></div>
+      </div>
+      <div class="artist-portrait-wrap">
+        <div class="artist-portrait" id="portrait"></div>
+      </div>
+      <h1 class="artist-name skeleton" id="name">&nbsp;</h1>
+      <!-- 官网 artist-expression-header__logo：有艺人字标（editorialArtwork.musicContentColorLogoTrimmed）时显示透明字标图，文字名仅保留给读屏 -->
+      <div class="artist-logo" id="logo" aria-hidden="true" hidden></div>
+      <div class="artist-actions">
+        <button class="artist-round-btn" id="shuffle" type="button" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="m15 15 6 6"/><path d="M4 4l5 5"/></svg>
+        </button>
+        <button class="artist-play-btn" id="play-all" type="button" disabled>
+          <svg viewBox="0 0 72 72" aria-hidden="true"><mask id="artist-play-mask"><rect width="72" height="72" fill="#fff"/><path d="M29 24.6v22.8c0 1.5 1.6 2.4 2.9 1.7l19.3-11.4c1.3-.8 1.3-2.6 0-3.4L31.9 22.9c-1.3-.7-2.9.2-2.9 1.7Z" fill="#000"/></mask><circle cx="36" cy="36" r="36" fill="currentColor" mask="url(#artist-play-mask)"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <div class="alert info" id="alert" hidden aria-live="polite"></div>
+
+    <!-- 官网 featured-content-and-tracks：最新发行 + 歌曲排行 -->
+    <section class="artist-featured" id="featured" hidden>
+      <div class="latest-wrap" id="latest-wrap" hidden>
+        <h2 class="shelf-heading" id="latest-title"></h2>
+        <div class="card-wrap latest-card" id="latest-card"><a class="latest" id="latest"></a></div>
+      </div>
+      <div class="top-songs-wrap" id="top-songs-wrap" hidden>
+        <h2 class="shelf-heading top-songs-heading" id="top-songs-title"></h2>
+        <div class="top-songs" id="top-songs"></div>
+      </div>
+    </section>
+
+    <div id="shelves"></div>
+
+    <section class="shelf-section artist-about" id="about" hidden>
+      <h2 class="shelf-heading" id="about-title"></h2>
+      <div class="artist-about-body">
+        <div class="album-notes" id="bio" hidden>
+          <p class="album-notes-text" id="bio-text"></p>
+          <button class="album-notes-more" id="bio-more" type="button" hidden></button>
+        </div>
+        <dl class="artist-facts" id="facts"></dl>
+      </div>
+    </section>
+
+    <!-- 官网 artist-detail-footer：在 Apple Music 中查看 -->
+    <div class="artist-footer">
+      <a class="artist-footer-link" id="apple-link" target="_blank" rel="noreferrer">
+        <span id="apple-link-text"></span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>
+      </a>
+    </div>
+  </main>
+</div>

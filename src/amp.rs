@@ -1,0 +1,834 @@
+//! Apple Music 目录接口（amp-api）代理。
+//!
+//! music.apple.com 的搜索页直接请求 `amp-api-edge.music.apple.com/v1/catalog/...`，
+//! 需要 `Authorization: Bearer <developer token>`，且只对 `Origin: https://music.apple.com` 放行跨域，
+//! 浏览器无法从本站直接调用。这里由服务端代为请求：developer token 取自 music.apple.com
+//! 前端脚本中内嵌的 JWT（与网页版相同），缓存后复用，遇到 401/403 时重新获取一次。
+//!
+//! 为了让页面请求 `/amp` 时立即得到结果，请求路径上尽量不做任何"首次"工作：
+//! - 专用 HTTP 客户端：经 ALPN 协商 HTTP/2，所有请求复用一条已握手的连接；浏览器中断请求（如输入联想被新输入取代）
+//!   只重置对应 stream，不会像 HTTP/1.1 那样连带关闭连接。启用 gzip / br 压缩传输，空闲连接不主动淘汰，并发送 HTTP/2 PING 保活。
+//! - 后台预热（[`run_warmer`]）：启动即获取 token、建立连接并预取地区表；之后连接空闲时定期发送轻量请求保持连接，
+//!   token 按 JWT 的 `exp` 在过期前于后台刷新，刷新期间请求继续使用旧 token。
+//! - 响应缓存：成功的响应按 URL 缓存（目录 5 分钟、地区表 24 小时，按字节计量的 LRU）。同一 URL 的并发请求共享一次上游请求，
+//!   上游请求在独立任务中执行，浏览器中断后仍会完成并写入缓存，紧接着的相同请求直接命中。
+//! - 响应头 `Server-Timing` 标明缓存命中情况与上游耗时，可在浏览器开发者工具中查看。
+//!
+//! 电台（station）还需要用户的 media-user-token（wrapper-lite 没有这些接口），由页面经 `X-Media-User-Token` 请求头带来，
+//! 服务端只转发、不保存、不缓存（[`station_assets_handler`] 等）：
+//! - 个人 / 编辑电台（`playParams.format = tracks`）的接下来几首：`POST amp-api.music.apple.com/v1/me/stations/next-tracks/<id>`；
+//! - 直播电台与广播单集（`format = stream`）的 HLS 地址与 license 服务器：`GET amp-api.music.apple.com/v1/play/assets`；
+//! - 它们的 Widevine / PlayReady license：页面按 MusicKit 的格式构造请求体，由服务端带上两个 token 发往 Apple 的 license 服务器。
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::Response;
+use base64::Engine;
+use bytes::Bytes;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use lru::LruCache;
+use regex::Regex;
+use reqwest::Client;
+use serde_json::json;
+use tracing::{debug, info, warn};
+
+use crate::log;
+use crate::state::AppState;
+
+const WEB_ORIGIN: &str = "https://music.apple.com";
+const API_ORIGIN: &str = "https://amp-api-edge.music.apple.com";
+/// 带用户 token 的接口（`/v1/me/...`、`/v1/play/assets`）与网页版 MusicKit 一样走 amp-api，不走 edge
+const USER_API_ORIGIN: &str = "https://amp-api.music.apple.com";
+/// 页面带来 media-user-token 的请求头
+pub const USER_TOKEN_HEADER: &str = "x-media-user-token";
+/// license 请求体（JSON，challenge 为 base64）的上限
+const MAX_LICENSE_BODY: usize = 256 * 1024;
+/// 网页版每次发布都会换 token，至少按此周期重新抓取；JWT 带 `exp` 时在过期前提前刷新
+const TOKEN_TTL: Duration = Duration::from_secs(12 * 3600);
+const TOKEN_EXPIRY_MARGIN: Duration = Duration::from_secs(3600);
+const MAX_QUERY_LEN: usize = 4096;
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
+/// 目录与搜索结果的缓存时间，与返回给浏览器的 `max-age` 一致
+const CATALOG_TTL: Duration = Duration::from_secs(300);
+/// 地区表几乎不变
+const STOREFRONTS_TTL: Duration = Duration::from_secs(24 * 3600);
+/// 保活请求：响应很小，同时能验证 token 仍然有效
+const PING_PATH: &str = "/v1/storefronts/us";
+/// 未开启保活时，后台检查 token 是否需要刷新的周期
+const TOKEN_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+static SCRIPT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"src="(/assets/index[~-][0-9A-Za-z_-]+\.js)""#).unwrap());
+static JWT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"eyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{10,}\.[0-9A-Za-z_-]{10,}").unwrap());
+
+/// amp-api 代理：专用连接、developer token 与响应缓存
+pub struct Amp {
+    client: Client,
+    /// 带用户 token 的请求：不跟随重定向（license 服务器地址来自页面，token 不能被带到别处）
+    user_client: Client,
+    token: DeveloperToken,
+    cache: ResponseCache,
+    epoch: Instant,
+    /// 最近一次 amp-api 请求（含保活）开始的时间（相对 `epoch` 的毫秒数），保活只在连接空闲时发送
+    last_request_ms: AtomicU64,
+}
+
+impl Amp {
+    /// `cache_bytes` 为 0 时不缓存响应，但并发的相同请求仍只请求一次上游
+    pub fn new(cache_bytes: usize) -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(None)
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("Failed to build amp-api HTTP client");
+        let user_client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .tcp_nodelay(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to build amp-api user HTTP client");
+        Self {
+            client,
+            user_client,
+            token: DeveloperToken::default(),
+            cache: ResponseCache::new(cache_bytes),
+            epoch: Instant::now(),
+            last_request_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn idle_for(&self) -> Duration {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_request_ms.load(Ordering::Relaxed)))
+    }
+
+    /// 取得 `url` 的响应：先查缓存，再加入同一 URL 进行中的请求，都没有时在独立任务中发起请求
+    async fn fetch(self: &Arc<Self>, url: String, ttl: Duration) -> (Lookup, Result<Arc<Upstream>, String>) {
+        if let Some(hit) = self.cache.get(&url) {
+            return (Lookup::Hit, Ok(hit));
+        }
+        let (pending, lookup) = {
+            let mut inflight = self.cache.inflight.lock().unwrap();
+            match inflight.get(&url) {
+                Some(pending) => (pending.clone(), Lookup::Shared),
+                None => {
+                    let amp = self.clone();
+                    let key = url.clone();
+                    let task = tokio::spawn(async move {
+                        // 持有 inflight 锁期间插入，任务结束（含 panic）时移除，因此不会删掉后来者的条目
+                        let _done = InflightGuard(amp.clone(), key.clone());
+                        let result = amp.request(&key, ttl).await.map(Arc::new);
+                        if let Ok(upstream) = &result {
+                            amp.cache.put(&key, upstream.clone());
+                        }
+                        result
+                    });
+                    let pending = task
+                        .map(|joined| joined.unwrap_or_else(|e| Err(format!("amp-api task failed: {e}"))))
+                        .boxed()
+                        .shared();
+                    inflight.insert(url, pending.clone());
+                    (pending, Lookup::Miss)
+                }
+            }
+        };
+        (lookup, pending.await)
+    }
+
+    /// 带 developer token 请求 amp-api；token 失效（401/403）时重新获取一次
+    async fn request(&self, url: &str, ttl: Duration) -> Result<Upstream, String> {
+        let mut retried = false;
+        loop {
+            let token = self.token.get(&self.client).await.map_err(|e| format!("developer token unavailable: {e}"))?;
+            self.last_request_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let started = Instant::now();
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(&*token)
+                .header(reqwest::header::ORIGIN, WEB_ORIGIN)
+                .header(reqwest::header::REFERER, format!("{WEB_ORIGIN}/"))
+                .header(reqwest::header::ACCEPT, "application/json")
+                .timeout(UPSTREAM_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| format!("amp-api request failed: {e}"))?;
+            let status = response.status();
+            if matches!(status.as_u16(), 401 | 403) && !retried {
+                info!(%status, "amp-api rejected the developer token, fetching a new one");
+                self.token.invalidate(&token);
+                retried = true;
+                continue;
+            }
+            let version = response.version();
+            let body = response.bytes().await.map_err(|e| format!("failed to read amp-api response: {e}"))?;
+            return Ok(Upstream {
+                status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                body,
+                expires_at: Instant::now() + ttl,
+                elapsed: started.elapsed(),
+                version,
+            });
+        }
+    }
+}
+
+impl Amp {
+    /// 带 developer token 与用户的 media-user-token 请求（不缓存）。401 / 403 多半是 media-user-token 失效，
+    /// 不像目录请求那样换 developer token 重试（后台预热会在 developer token 过期前刷新）。
+    /// `license` 为 `Some(renewal)` 时按 MusicKit 的 license 请求发送（`X-Apple-Music-User-Token`，
+    /// Widevine 时另带 `X-Apple-Renewal: true`）
+    async fn user_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        user_token: &str,
+        body: Option<Bytes>,
+        license: Option<bool>,
+    ) -> Result<Upstream, String> {
+        let token = self.token.get(&self.client).await.map_err(|e| format!("developer token unavailable: {e}"))?;
+        let started = Instant::now();
+        let mut request = self
+            .user_client
+            .request(method, url)
+            .bearer_auth(&*token)
+            .header(reqwest::header::ORIGIN, WEB_ORIGIN)
+            .header(reqwest::header::REFERER, format!("{WEB_ORIGIN}/"))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(UPSTREAM_TIMEOUT);
+        request = match license {
+            Some(renewal) => {
+                let request = request.header("x-apple-music-user-token", user_token);
+                if renewal { request.header("x-apple-renewal", "true") } else { request }
+            }
+            None => request.header("media-user-token", user_token),
+        };
+        if let Some(body) = body {
+            request = request.header(CONTENT_TYPE, "application/json").body(body);
+        }
+        let response = request.send().await.map_err(|e| format!("Apple request failed: {e}"))?;
+        let status = response.status();
+        let version = response.version();
+        let body = response.bytes().await.map_err(|e| format!("failed to read Apple response: {e}"))?;
+        Ok(Upstream {
+            status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+            expires_at: Instant::now(),
+            elapsed: started.elapsed(),
+            version,
+        })
+    }
+}
+
+/// 缓存查找结果，写入 `Server-Timing`
+#[derive(Clone, Copy)]
+enum Lookup {
+    /// 命中缓存
+    Hit,
+    /// 加入了同一 URL 进行中的上游请求
+    Shared,
+    /// 发起了新的上游请求
+    Miss,
+}
+
+impl Lookup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Lookup::Hit => "hit",
+            Lookup::Shared => "shared",
+            Lookup::Miss => "miss",
+        }
+    }
+}
+
+/// 一次上游响应
+struct Upstream {
+    status: StatusCode,
+    body: Bytes,
+    expires_at: Instant,
+    elapsed: Duration,
+    version: reqwest::Version,
+}
+
+type Pending = Shared<BoxFuture<'static, Result<Arc<Upstream>, String>>>;
+
+/// 成功响应的按字节计量 LRU 缓存 + 同一 URL 进行中的请求
+struct ResponseCache {
+    lru: Mutex<(LruCache<String, Arc<Upstream>>, usize)>,
+    capacity: usize,
+    inflight: Mutex<HashMap<String, Pending>>,
+}
+
+impl ResponseCache {
+    fn new(capacity: usize) -> Self {
+        Self { lru: Mutex::new((LruCache::unbounded(), 0)), capacity, inflight: Mutex::default() }
+    }
+
+    fn get(&self, url: &str) -> Option<Arc<Upstream>> {
+        let mut guard = self.lru.lock().unwrap();
+        let (lru, used) = &mut *guard;
+        let entry = lru.get(url)?.clone();
+        if entry.expires_at > Instant::now() {
+            return Some(entry);
+        }
+        lru.pop(url);
+        *used -= entry.body.len();
+        None
+    }
+
+    fn put(&self, url: &str, upstream: Arc<Upstream>) {
+        if !upstream.status.is_success() || upstream.body.len() > self.capacity {
+            return;
+        }
+        let mut guard = self.lru.lock().unwrap();
+        let (lru, used) = &mut *guard;
+        *used += upstream.body.len();
+        if let Some(old) = lru.put(url.to_owned(), upstream) {
+            *used -= old.body.len();
+        }
+        while *used > self.capacity {
+            match lru.pop_lru() {
+                Some((_, old)) => *used -= old.body.len(),
+                None => break,
+            }
+        }
+    }
+}
+
+struct InflightGuard(Arc<Amp>, String);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.cache.inflight.lock().unwrap().remove(&self.1);
+    }
+}
+
+struct Token {
+    value: Arc<str>,
+    refresh_at: Instant,
+}
+
+/// 缓存的 developer token。抓取过程持有锁，并发请求只会抓取一次；后台刷新期间请求继续使用旧 token。
+#[derive(Default)]
+struct DeveloperToken {
+    current: RwLock<Option<Token>>,
+    fetching: tokio::sync::Mutex<()>,
+}
+
+impl DeveloperToken {
+    /// 已有 token 时直接返回（即使到了刷新时间，刷新由后台完成，过期则由 401 触发重新获取）
+    async fn get(&self, client: &Client) -> Result<Arc<str>, String> {
+        if let Some(token) = self.cached() {
+            return Ok(token);
+        }
+        let _fetching = self.fetching.lock().await;
+        if let Some(token) = self.cached() {
+            return Ok(token);
+        }
+        self.fetch(client).await
+    }
+
+    fn cached(&self) -> Option<Arc<str>> {
+        self.current.read().unwrap().as_ref().map(|t| t.value.clone())
+    }
+
+    fn needs_refresh(&self) -> bool {
+        self.current.read().unwrap().as_ref().is_none_or(|t| Instant::now() >= t.refresh_at)
+    }
+
+    /// 后台刷新；其他请求在此期间继续使用旧 token
+    async fn refresh(&self, client: &Client) -> Result<(), String> {
+        let _fetching = self.fetching.lock().await;
+        if self.needs_refresh() {
+            self.fetch(client).await?;
+        }
+        Ok(())
+    }
+
+    /// 调用方需持有 `fetching`
+    async fn fetch(&self, client: &Client) -> Result<Arc<str>, String> {
+        let value: Arc<str> = fetch_developer_token(client).await?.into();
+        let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let refresh_in = refresh_delay(&value, now_unix);
+        info!(refresh_in = %format!("{} min", refresh_in.as_secs() / 60), "Fetched Apple Music web developer token");
+        *self.current.write().unwrap() = Some(Token { value: value.clone(), refresh_at: Instant::now() + refresh_in });
+        Ok(value)
+    }
+
+    /// 丢弃失效的 token；若缓存已被其他请求换成新 token 则保留
+    fn invalidate(&self, token: &str) {
+        let mut current = self.current.write().unwrap();
+        if current.as_ref().is_some_and(|t| &*t.value == token) {
+            *current = None;
+        }
+    }
+}
+
+/// 距下次刷新的时间：不超过 [`TOKEN_TTL`]，JWT 带 `exp` 时提前 [`TOKEN_EXPIRY_MARGIN`]，至少 1 分钟
+fn refresh_delay(token: &str, now_unix: u64) -> Duration {
+    let until_expiry = token_expiry(token)
+        .map(|exp| Duration::from_secs(exp.saturating_sub(now_unix)).saturating_sub(TOKEN_EXPIRY_MARGIN));
+    until_expiry.map_or(TOKEN_TTL, |d| d.min(TOKEN_TTL)).max(Duration::from_secs(60))
+}
+
+/// JWT payload 中的 `exp`（Unix 秒）
+fn token_expiry(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get("exp")?.as_u64()
+}
+
+/// 从 music.apple.com 页面找到主脚本 `index~<hash>.js`，取出其中内嵌的 JWT
+async fn fetch_developer_token(client: &Client) -> Result<String, String> {
+    let page = fetch_text(client, &format!("{WEB_ORIGIN}/us/browse")).await?;
+    let script = extract_script_path(&page).ok_or("main script not found on music.apple.com")?;
+    let js = fetch_text(client, &format!("{WEB_ORIGIN}{script}")).await?;
+    extract_token(&js).map(str::to_owned).ok_or_else(|| "developer token not found in music.apple.com script".into())
+}
+
+async fn fetch_text(client: &Client, url: &str) -> Result<String, String> {
+    client
+        .get(url)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("request to {url} failed: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("failed to read {url}: {e}"))
+}
+
+fn extract_script_path(html: &str) -> Option<&str> {
+    SCRIPT_RE.captures(html).and_then(|c| c.get(1)).map(|m| m.as_str())
+}
+
+/// 脚本里第一个 JWT 即网页版 MusicKit 使用的 developer token
+fn extract_token(js: &str) -> Option<&str> {
+    JWT_RE.find(js).map(|m| m.as_str())
+}
+
+/// 后台预热：启动后立即获取 token、建立到 amp-api 的连接并预取地区表（页面首次加载即会请求它）。
+/// 之后每个周期检查 token 是否需要刷新；`keepalive` 非零时，连接空闲超过半个周期就发送一次轻量请求，
+/// 保持连接与 TLS 会话，同时尽早发现 token 失效。
+pub async fn run_warmer(amp: Arc<Amp>, keepalive: Duration) {
+    let started = Instant::now();
+    match amp.fetch(api_url("/v1/storefronts", ""), STOREFRONTS_TTL).await.1 {
+        Ok(up) if up.status.is_success() => {
+            info!(version = ?up.version, elapsed = ?started.elapsed(), "amp-api connection ready");
+        }
+        Ok(up) => warn!(status = %up.status, "amp-api warm-up request failed"),
+        Err(e) => warn!(error = %e, "amp-api warm-up failed"),
+    }
+
+    let period = if keepalive.is_zero() { TOKEN_CHECK_INTERVAL } else { keepalive };
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut refresh_failing = false;
+    loop {
+        ticker.tick().await;
+        if amp.token.needs_refresh() {
+            match amp.token.refresh(&amp.client).await {
+                Ok(()) => refresh_failing = false,
+                // 持续失败（如断网）时只在第一次告警，之后每个周期静默重试
+                Err(e) if !refresh_failing => {
+                    refresh_failing = true;
+                    warn!(error = %e, "Developer token refresh failed, retrying in the background");
+                }
+                Err(e) => debug!(error = %e, "Developer token refresh failed"),
+            }
+        }
+        if !keepalive.is_zero() && amp.idle_for() >= keepalive / 2 {
+            match amp.request(&api_url(PING_PATH, ""), Duration::ZERO).await {
+                Ok(up) => debug!(status = %up.status, version = ?up.version, elapsed = ?up.elapsed, "amp-api keep-alive"),
+                Err(e) => debug!(error = %e, "amp-api keep-alive failed"),
+            }
+        }
+    }
+}
+
+fn api_url(path: &str, query: &str) -> String {
+    api_url_at(API_ORIGIN, path, query)
+}
+
+fn api_url_at(origin: &str, path: &str, query: &str) -> String {
+    let mut url = format!("{origin}{path}");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
+}
+
+/// 目录路径只允许 amp-api 资源路径中出现的字符，拒绝 `..`
+fn valid_catalog_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.contains("..")
+        && path.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.,:/".contains(&b))
+}
+
+/// `GET /amp/v1/catalog/<path>?<query>` → `amp-api-edge.music.apple.com/v1/catalog/<path>?<query>`。
+/// 查询参数原样转发，前端可直接请求搜索结果里的 `next` 分页地址（加上 `/amp` 前缀）。
+pub async fn catalog_handler(State(state): State<Arc<AppState>>, Path(path): Path<String>, uri: Uri) -> Response<Body> {
+    if !valid_catalog_path(&path) {
+        return error(StatusCode::BAD_REQUEST, "Invalid catalog path");
+    }
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    forward(&state, api_url(&format!("/v1/catalog/{path}"), query), CATALOG_TTL).await
+}
+
+/// `GET /amp/v1/editorial/<path>?<query>` → `amp-api-edge.music.apple.com/v1/editorial/<path>?<query>`。
+/// music.apple.com 的「新发现」页（groupings?name=music）、分组页（groupings/<id>）、room 与 multi-room 页的编辑内容都在这里，
+/// 与目录接口一样按 URL 缓存；分页地址（rooms/<id>/contents?offset=）同样可直接加上 `/amp` 前缀请求。
+pub async fn editorial_handler(State(state): State<Arc<AppState>>, Path(path): Path<String>, uri: Uri) -> Response<Body> {
+    if !valid_catalog_path(&path) {
+        return error(StatusCode::BAD_REQUEST, "Invalid editorial path");
+    }
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    forward(&state, api_url(&format!("/v1/editorial/{path}"), query), CATALOG_TTL).await
+}
+
+/// `GET /amp/v1/storefronts?<query>` → 全部地区信息。前端据各地区的 `supportedLanguageTags` 选择 `l`：
+/// 地区不支持的语言不会报错，而是静默回退到默认语言（如 cn 只支持 zh-Hans-CN / en-GB，传 en-US 返回中文）。
+/// 数据几乎不变，前端取一次后缓存在 localStorage；查询参数原样转发，以便跟随分页 `next`。
+pub async fn storefronts_handler(State(state): State<Arc<AppState>>, uri: Uri) -> Response<Body> {
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    forward(&state, api_url("/v1/storefronts", query), STOREFRONTS_TTL).await
+}
+
+/* ---------- 电台：需要 media-user-token 的接口 ---------- */
+
+/// 页面带来的 media-user-token；缺失或含非法字符时为 None
+fn user_token(headers: &HeaderMap) -> Option<&str> {
+    let token = headers.get(USER_TOKEN_HEADER)?.to_str().ok()?.trim();
+    (!token.is_empty() && token.len() <= 4096 && token.bytes().all(|b| b.is_ascii_graphic())).then_some(token)
+}
+
+/// 电台 ID：编辑 / 直播电台为 `ra.<数字>`，个人电台为 `ra.u-<…>` 等
+pub fn valid_station_id(id: &str) -> bool {
+    id.len() > 3
+        && id.len() <= 128
+        && id.starts_with("ra.")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn missing_user_token() -> Response<Body> {
+    error(StatusCode::UNAUTHORIZED, "media-user-token required")
+}
+
+/// 原样返回上游的状态码与 JSON，不缓存
+async fn forward_user(
+    state: &AppState,
+    method: reqwest::Method,
+    url: String,
+    token: &str,
+    body: Option<Bytes>,
+    license: Option<bool>,
+) -> Response<Body> {
+    let upstream = match state.amp.user_request(method, &url, token, body, license).await {
+        Ok(upstream) => upstream,
+        Err(msg) => return error(StatusCode::BAD_GATEWAY, &msg),
+    };
+    let status = upstream.status;
+    let note = if status.is_success() { String::new() } else { api_error_summary(&upstream.body) };
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .header("server-timing", format!("upstream;dur={:.1}", upstream.elapsed.as_secs_f64() * 1000.0))
+        .body(Body::from(upstream.body))
+        .unwrap();
+    log::note(response, note)
+}
+
+/// `GET /station/assets?<playParams>` → `amp-api.music.apple.com/v1/play/assets?<playParams>`：
+/// 直播电台与广播单集的 HLS 地址与 license 服务器（MusicKit 的 resolveRadioStationAsset，查询参数为 playParams 加 `keyFormat=web`）
+pub async fn station_assets_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    let query = uri.query().unwrap_or_default();
+    if query.is_empty() || query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Invalid play assets query");
+    }
+    let url = format!("{USER_API_ORIGIN}/v1/play/assets?{query}");
+    forward_user(&state, reqwest::Method::GET, url, token, None, None).await
+}
+
+/// `POST /station/next-tracks/<id>?<query>` → `amp-api.music.apple.com/v1/me/stations/next-tracks/<id>`：
+/// 个人 / 编辑电台接下来要播放的几首（MusicKit 的 loadStationNextTracks）
+pub async fn station_next_tracks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    if !valid_station_id(&id) {
+        return error(StatusCode::BAD_REQUEST, "Invalid station id");
+    }
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    let url = api_url_at(USER_API_ORIGIN, &format!("/v1/me/stations/next-tracks/{id}"), query);
+    forward_user(&state, reqwest::Method::POST, url, token, None, None).await
+}
+
+/// `GET /station/catalog/<path>?<query>` → `amp-api.music.apple.com/v1/catalog/<path>`（带用户 token，不缓存）：
+/// 个人电台（`stations?filter[identity]=personal`，官网 /station/me）等因人而异的目录数据
+pub async fn station_catalog_handler(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    if !valid_catalog_path(&path) {
+        return error(StatusCode::BAD_REQUEST, "Invalid catalog path");
+    }
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    let url = api_url_at(USER_API_ORIGIN, &format!("/v1/catalog/{path}"), query);
+    forward_user(&state, reqwest::Method::GET, url, token, None, None).await
+}
+
+/// `GET /station/recent?<query>` → `amp-api.music.apple.com/v1/me/recent/radio-stations`：广播页的「最近播放」（官网 recently-played-radio-shelf）
+pub async fn station_recent_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, uri: Uri) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    let query = uri.query().unwrap_or_default();
+    if query.len() > MAX_QUERY_LEN {
+        return error(StatusCode::BAD_REQUEST, "Query too long");
+    }
+    let url = api_url_at(USER_API_ORIGIN, "/v1/me/recent/radio-stations", query);
+    forward_user(&state, reqwest::Method::GET, url, token, None, None).await
+}
+
+/// `GET /station/storefront` → `amp-api.music.apple.com/v1/me/storefront`：页面据此检验填入的 media-user-token，并显示账号地区
+pub async fn station_storefront_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    forward_user(&state, reqwest::Method::GET, format!("{USER_API_ORIGIN}/v1/me/storefront"), token, None, None).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct StationLicense {
+    /// `/v1/play/assets` 返回的 `keyServerUrl`
+    url: String,
+    /// 原样发给 license 服务器的 JSON（challenge、uri、key-system 等，格式按服务器地址选择，见 station.mjs）
+    body: serde_json::Value,
+    /// Widevine 的请求（MusicKit 此时带 `X-Apple-Renewal: true`）
+    #[serde(default)]
+    renewal: bool,
+}
+
+/// 电台 license 服务器：Apple 的 HTTPS 地址，路径为 MusicKit 认识的几种 license 接口之一
+fn valid_license_url(raw: &str) -> bool {
+    const PATHS: [&str; 7] = [
+        "/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense",
+        "/WebObjects/MZPlay.woa/web/radio/versions/1/license",
+        "/v1/radio/streaming-key-delivery",
+        "/v1/hls/streaming-key-delivery",
+        "/WebObjects/MZPlay.woa/wa/fpsRequest",
+        "/WebObjects/MZPlayLocal.woa/wa/fpsRequest",
+        "/WebObjects/MZPlay.woa/podcast/hls/license/streaming/start",
+    ];
+    reqwest::Url::parse(raw)
+        .ok()
+        .is_some_and(|url| crate::state::is_apple_https(&url) && PATHS.iter().any(|p| url.path().ends_with(p)))
+}
+
+/// `POST /station/license`：`{ url, body }` → 带 developer token 与 media-user-token 把 `body` POST 给 `url`，原样返回响应。
+/// wrapper-lite 的 `/license` 不支持电台的 license，由这里直接请求 Apple
+pub async fn station_license_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    let Some(token) = user_token(&headers) else { return missing_user_token() };
+    if body.len() > MAX_LICENSE_BODY {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "License request too large");
+    }
+    let Ok(request) = serde_json::from_slice::<StationLicense>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "Invalid license request");
+    };
+    if !valid_license_url(&request.url) || !request.body.is_object() {
+        return error(StatusCode::BAD_REQUEST, "Invalid license request");
+    }
+    let payload = Bytes::from(request.body.to_string());
+    forward_user(&state, reqwest::Method::POST, request.url, token, Some(payload), Some(request.renewal)).await
+}
+
+/// 原样返回 amp-api 的状态码与 JSON；成功响应的 `max-age` 为缓存剩余时间
+async fn forward(state: &AppState, url: String, ttl: Duration) -> Response<Body> {
+    let (lookup, result) = state.amp.fetch(url, ttl).await;
+    let upstream = match result {
+        Ok(upstream) => upstream,
+        Err(msg) => return error(StatusCode::BAD_GATEWAY, &msg),
+    };
+    let status = upstream.status;
+    let cache = if status.is_success() {
+        let remaining = upstream.expires_at.saturating_duration_since(Instant::now());
+        format!("private, max-age={}", remaining.as_secs())
+    } else {
+        "no-store".to_owned()
+    };
+    let mut timing = format!("cache;desc={}", lookup.as_str());
+    if !matches!(lookup, Lookup::Hit) {
+        timing.push_str(&format!(", upstream;dur={:.1}", upstream.elapsed.as_secs_f64() * 1000.0));
+    }
+    let note = match lookup {
+        _ if !status.is_success() => api_error_summary(&upstream.body),
+        Lookup::Hit => "cached".to_owned(),
+        _ => String::new(),
+    };
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(CACHE_CONTROL, cache)
+        .header("server-timing", timing)
+        .body(Body::from(upstream.body.clone()))
+        .unwrap();
+    log::note(response, note)
+}
+
+/// amp-api 错误响应 `{"errors":[{"title","detail"}]}` 的首条说明，供请求日志输出
+fn api_error_summary(body: &[u8]) -> String {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let first = value.pointer("/errors/0");
+    let field = |key| first.and_then(|e| e.get(key)).and_then(serde_json::Value::as_str);
+    field("detail").or_else(|| field("title")).unwrap_or_default().to_owned()
+}
+
+fn error(status: StatusCode, msg: &str) -> Response<Body> {
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Body::from(json!({ "code": 1, "msg": msg }).to_string()))
+        .unwrap();
+    log::note(response, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_script_and_token() {
+        let html = r#"<script type="module" crossorigin src="/assets/index~1c4278bfb3.js"></script>
+            <script nomodule src="/assets/index-legacy~dc41388d00.js"></script>"#;
+        assert_eq!(extract_script_path(html), Some("/assets/index~1c4278bfb3.js"));
+        assert_eq!(extract_script_path(r#"<script src="/assets/index-legacy~dc41388d00.js">"#), None);
+
+        let js = r#"const yo="2638.11.0-external",Ua="eyJ0eXAiOiJKV1QiLCJhbGci.eyJpc3MiOiJBTVBXZWJQbGF5.sig_nature-0123",b="eyJzZWNvbmQi.eyJzZWNvbmQiOjF9.abcdefghijkl";"#;
+        assert_eq!(extract_token(js), Some("eyJ0eXAiOiJKV1QiLCJhbGci.eyJpc3MiOiJBTVBXZWJQbGF5.sig_nature-0123"));
+        assert_eq!(extract_token("no token here"), None);
+    }
+
+    #[test]
+    fn test_valid_catalog_path() {
+        assert!(valid_catalog_path("us/search"));
+        assert!(valid_catalog_path("cn/search/suggestions"));
+        assert!(valid_catalog_path("us/songs/1468058171"));
+        assert!(valid_catalog_path("cn/groupings"));
+        assert!(valid_catalog_path("cn/rooms/6818358937/contents"));
+        assert!(valid_catalog_path("us/multirooms/1532467784"));
+        assert!(!valid_catalog_path(""));
+        assert!(!valid_catalog_path("../me/library"));
+        assert!(!valid_catalog_path("us/search?x"));
+        assert!(!valid_catalog_path("us/%2e%2e/x"));
+    }
+
+    #[test]
+    fn test_station_validation() {
+        assert!(valid_station_id("ra.978194965"));
+        assert!(valid_station_id("ra.u-5e1a0b_x"));
+        assert!(!valid_station_id("ra."));
+        assert!(!valid_station_id("pl.123"));
+        assert!(!valid_station_id("ra.1/../x"));
+        assert!(valid_license_url("https://play.itunes.apple.com/WebObjects/MZPlay.woa/web/radio/versions/1/license"));
+        assert!(valid_license_url("https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense"));
+        assert!(valid_license_url("https://play.music.apple.com/v1/radio/streaming-key-delivery"));
+        assert!(!valid_license_url("https://example.com/v1/radio/streaming-key-delivery"));
+        assert!(!valid_license_url("http://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense"));
+        assert!(!valid_license_url("https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/other"));
+        let mut headers = HeaderMap::new();
+        assert_eq!(user_token(&headers), None);
+        headers.insert(USER_TOKEN_HEADER, " 0.Abc+/= ".parse().unwrap());
+        assert_eq!(user_token(&headers), Some("0.Abc+/="));
+    }
+
+    fn jwt(payload: &str) -> String {
+        let encode = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        format!("{}.{}.signature", encode(r#"{"alg":"ES256"}"#), encode(payload))
+    }
+
+    #[test]
+    fn test_refresh_delay() {
+        let now = 1_000_000;
+        assert_eq!(token_expiry(&jwt(r#"{"iss":"x","exp":1003600}"#)), Some(1_003_600));
+        // 2 小时后过期：提前 1 小时刷新
+        assert_eq!(refresh_delay(&jwt(r#"{"exp":1007200}"#), now), Duration::from_secs(3600));
+        // 远期过期：不超过 12 小时
+        assert_eq!(refresh_delay(&jwt(r#"{"exp":9000000}"#), now), TOKEN_TTL);
+        // 即将或已经过期、没有 exp、无法解析：分别为 1 分钟下限与默认周期
+        assert_eq!(refresh_delay(&jwt(r#"{"exp":1000100}"#), now), Duration::from_secs(60));
+        assert_eq!(refresh_delay(&jwt(r#"{"iss":"x"}"#), now), TOKEN_TTL);
+        assert_eq!(refresh_delay("not-a-jwt", now), TOKEN_TTL);
+    }
+
+    fn upstream(status: StatusCode, body: &'static [u8], ttl: Duration) -> Arc<Upstream> {
+        Arc::new(Upstream {
+            status,
+            body: Bytes::from_static(body),
+            expires_at: Instant::now() + ttl,
+            elapsed: Duration::ZERO,
+            version: reqwest::Version::HTTP_2,
+        })
+    }
+
+    #[test]
+    fn test_response_cache() {
+        let cache = ResponseCache::new(10);
+        cache.put("a", upstream(StatusCode::OK, b"123456", CATALOG_TTL));
+        assert!(cache.get("a").is_some());
+
+        cache.put("err", upstream(StatusCode::NOT_FOUND, b"{}", CATALOG_TTL));
+        assert!(cache.get("err").is_none(), "only successful responses are cached");
+
+        cache.put("expired", upstream(StatusCode::OK, b"12", Duration::ZERO));
+        assert!(cache.get("expired").is_none());
+        assert_eq!(cache.lru.lock().unwrap().1, 6, "expired entries are dropped on lookup");
+
+        cache.put("b", upstream(StatusCode::OK, b"abcdef", CATALOG_TTL));
+        assert!(cache.get("a").is_none(), "oldest entry evicted once over capacity");
+        assert!(cache.get("b").is_some());
+
+        let disabled = ResponseCache::new(0);
+        disabled.put("a", upstream(StatusCode::OK, b"1", CATALOG_TTL));
+        assert!(disabled.get("a").is_none());
+    }
+}

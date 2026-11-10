@@ -1,0 +1,100 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct Config {
+    pub wrapper_url: String,
+    /// amp-api 连接空闲时的保活周期，0 表示不发送保活请求
+    pub amp_keepalive: Duration,
+    /// amp-api 响应缓存容量（MB），0 表示不缓存
+    pub amp_cache_mb: usize,
+    /// 每秒发往 wrapper-lite 的最大请求数，0 表示不限
+    pub wrapper_rate: u32,
+    /// 同时进行的 wrapper-lite 请求上限，0 表示不限
+    pub wrapper_concurrency: usize,
+    /// wrapper-lite 请求的 `Authorization` 头（已规范化），None 表示不发送
+    pub wrapper_auth: Option<String>,
+    /// 服务端是否转发 wrapper-lite；否则页面只用浏览器直连（本地模式），
+    /// `wrapper_url` / `wrapper_rate` / `wrapper_concurrency` 作为页面的默认值
+    pub wrapper_relay: bool,
+    /// 页面本地 wrapper-lite 设置上方的提示（如去哪里申请公共 wrapper-lite 的 token）
+    pub wrapper_hint: Option<String>,
+    /// 每个客户端 IP 每分钟转发 wrapper-lite 的请求上限（不含 `/status`），0 表示不限
+    pub client_rate: u32,
+    /// 每个客户端 IP 同时转发 wrapper-lite 的请求上限（不含 `/status`），超出的排队，0 表示不限
+    pub client_concurrency: usize,
+    /// 取客户端 IP 的请求头（小写，由反向代理设置），None 表示用 TCP 对端地址
+    pub client_ip_header: Option<String>,
+}
+
+pub struct AppState {
+    pub config: Config,
+    pub http_client: reqwest::Client,
+    /// 同 `http_client`，但重定向只允许跳到 apple.com（处理不受信任的 URL）
+    pub apple_client: reqwest::Client,
+    /// wrapper-lite 客户端（限速、限并发、鉴权）
+    pub wrapper: crate::wrapper::Wrapper,
+    /// amp-api（Apple Music 目录 / 搜索）代理：专用连接、developer token 与响应缓存
+    pub amp: Arc<crate::amp::Amp>,
+    /// 按客户端 IP 限流（见 [`crate::limit`]）
+    pub client_limit: crate::limit::ClientLimit,
+    /// `/status` 的共用缓存（见 [`crate::ui::status_handler`]）
+    pub status_cache: crate::ui::StatusCache,
+}
+
+impl AppState {
+    /// 默认配置（测试用）
+    pub fn new(wrapper_url: String) -> Self {
+        Self::with_config(Config {
+            wrapper_url: wrapper_url.trim_end_matches('/').to_string(),
+            amp_keepalive: Duration::from_secs(30),
+            amp_cache_mb: 32,
+            wrapper_rate: 24,
+            wrapper_concurrency: 24,
+            wrapper_auth: None,
+            wrapper_relay: true,
+            wrapper_hint: None,
+            client_rate: 0,
+            client_concurrency: 0,
+            client_ip_header: None,
+        })
+    }
+
+    pub fn with_config(config: Config) -> Self {
+        // wrapper-lite 与 Apple CDN（master m3u8）：保持 HTTP/1.1、不请求压缩（amp-api 另用专用客户端）
+        let builder = || reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(32)
+            .http1_only()
+            .no_gzip()
+            .no_brotli();
+        let http_client = builder().build().expect("Failed to build reqwest HTTP client");
+        // 用于页面传来的 master 地址：重定向只允许留在 apple.com 的 HTTPS 地址，最多 10 跳
+        let apple_client = builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    attempt.error("too many redirects")
+                } else if is_apple_https(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()
+            .expect("Failed to build reqwest Apple-only HTTP client");
+        let amp = Arc::new(crate::amp::Amp::new(config.amp_cache_mb * 1024 * 1024));
+        let wrapper = crate::wrapper::Wrapper::new(&config);
+        let client_limit = crate::limit::ClientLimit::new(config.client_rate, config.client_concurrency, config.client_ip_header.as_deref());
+        Self { config, http_client, apple_client, wrapper, amp, client_limit, status_cache: Default::default() }
+    }
+}
+
+/// HTTPS、无端口、无用户名，且主机为 apple.com 或其子域名
+pub fn is_apple_https(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.host_str().is_some_and(|host| host == "apple.com" || host.ends_with(".apple.com"))
+}
